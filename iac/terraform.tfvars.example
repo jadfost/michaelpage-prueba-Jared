@@ -1,0 +1,5 @@
+# Copiar a terraform.tfvars y completar con valores reales
+project_id = "mi-proyecto-gcp-123"
+region     = "us-central1"
+prefix     = "myorg"
+owner      = "data-team"

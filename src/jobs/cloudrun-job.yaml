@@ -1,0 +1,59 @@
+# cloudrun-job.yaml
+# Desplegar con:
+#   gcloud run jobs create refresh-biglake \
+#     --region us-central1 \
+#     --image gcr.io/<PROJECT_ID>/refresh-biglake:latest \
+#     --execute-now
+#
+# Programar con Cloud Scheduler (ej. cada hora):
+#   gcloud scheduler jobs create http refresh-biglake-scheduler \
+#     --schedule "0 * * * *" \
+#     --uri "https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/<PROJECT_ID>/jobs/refresh-biglake:run" \
+#     --oauth-service-account-email <SA>@<PROJECT_ID>.iam.gserviceaccount.com
+
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: refresh-biglake
+  labels:
+    environment: dev
+    owner: data-team
+    managed_by: terraform
+spec:
+  template:
+    spec:
+      containers:
+        - image: gcr.io/${PROJECT_ID}/refresh-biglake:latest
+          args:
+            - "--adls-account=$(ADLS_ACCOUNT)"
+            - "--adls-container=$(ADLS_CONTAINER)"
+            - "--delta-path=$(DELTA_PATH)"
+            - "--gcp-project=$(GCP_PROJECT)"
+            - "--bq-dataset=$(BQ_DATASET)"
+            - "--bq-table=$(BQ_TABLE)"
+            - "--bq-connection=$(BQ_CONNECTION)"
+          env:
+            - name: ADLS_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: adls-account
+                  key: value
+            - name: ADLS_CONTAINER
+              value: "my-delta-container"
+            - name: DELTA_PATH
+              value: "/data/transactions_uniform"
+            - name: GCP_PROJECT
+              value: "${PROJECT_ID}"
+            - name: BQ_DATASET
+              value: "dw_dev"
+            - name: BQ_TABLE
+              value: "transactions_federated"
+            - name: BQ_CONNECTION
+              value: "projects/${PROJECT_ID}/locations/aws-us-east-1/connections/adls-biglake-conn"
+          resources:
+            limits:
+              cpu: "1"
+              memory: "512Mi"
+      serviceAccountName: "${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
+      maxRetries: 3
+      timeoutSeconds: 600

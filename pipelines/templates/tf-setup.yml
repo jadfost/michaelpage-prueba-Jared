@@ -1,0 +1,34 @@
+# templates/tf-setup.yml
+steps:
+  - powershell: |
+      $version = "$(TF_VERSION)"
+      $url = "https://releases.hashicorp.com/terraform/$version/terraform_${version}_windows_amd64.zip"
+      Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\terraform.zip"
+      Expand-Archive -Path "$env:TEMP\terraform.zip" -DestinationPath "C:\terraform" -Force
+      echo "##vso[task.prependpath]C:\terraform"
+      Write-Host "Terraform instalado en C:\terraform"
+    displayName: "Instalar Terraform $(TF_VERSION)"
+
+  - powershell: |
+      terraform version
+    displayName: "Verificar Terraform"
+
+  - powershell: |
+      $base64 = $env:GCP_SA_KEY_JSON
+      $bytes = [Convert]::FromBase64String($base64.Trim())
+      $json = [System.Text.Encoding]::UTF8.GetString($bytes)
+      $path = "$env:TEMP\sa_key.json"
+      [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding $false))
+      Write-Host "Credenciales escritas en $path"
+      echo "##vso[task.setvariable variable=GOOGLE_APPLICATION_CREDENTIALS]$path"
+    displayName: "Configurar credenciales GCP"
+    env:
+      GCP_SA_KEY_JSON: $(GCP_SA_KEY_JSON)
+
+  - powershell: |
+      $env:GOOGLE_APPLICATION_CREDENTIALS = "$env:TEMP\sa_key.json"
+      Set-Location $(TF_WORKING_DIR)
+      terraform init
+    displayName: "terraform init"
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)

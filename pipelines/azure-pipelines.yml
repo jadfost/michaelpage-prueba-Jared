@@ -1,0 +1,254 @@
+# azure-pipelines.yml
+# Pipeline multi-stage: Terraform IaC en GCP con aprobaciones
+# + stage de federación BigLake (Delta Lake en GCS)
+# Ramas: dev -> qa -> prod
+
+trigger:
+  branches:
+    include:
+      - dev
+      - qa
+      - prod
+
+variables:
+  - group: gcp-credentials
+  - name: TF_VERSION
+    value: "1.7.5"
+  - name: TF_WORKING_DIR
+    value: "$(System.DefaultWorkingDirectory)/iac"
+  - name: TF_PREFIX
+    value: "mp"
+  - name: TF_REGION
+    value: "us-central1"
+  - name: GCS_BUCKET
+    value: "raw-dev-michaelpage-prueba"
+  - name: DELTA_PATH
+    value: "delta/transactions"
+  - name: BQ_DATASET
+    value: "dw_dev"
+  - name: BQ_TABLE
+    value: "transactions_federated"
+
+stages:
+  # ────────────────────────────────────────────────────────────
+  # DEV
+  # ────────────────────────────────────────────────────────────
+  - stage: plan_dev
+    displayName: "🔍 Plan – DEV"
+    condition: eq(variables['Build.SourceBranch'], 'refs/heads/dev')
+    jobs:
+      - job: terraform_plan_dev
+        displayName: "Terraform Plan DEV"
+        pool: Default
+        steps:
+          - template: templates/tf-setup.yml
+          - powershell: |
+              Set-Location "$(TF_WORKING_DIR)"
+              terraform workspace select dev
+              if ($LASTEXITCODE -ne 0) { terraform workspace new dev }
+              $project = "$(GCP_PROJECT_ID)"
+              $prefix  = "$(TF_PREFIX)"
+              $region  = "$(TF_REGION)"
+              terraform plan -var "project_id=$project" -var "prefix=$prefix" -var "region=$region" -target module.dev -out tfplan_dev
+            displayName: "terraform plan (dev)"
+            env:
+              GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+          - publish: $(TF_WORKING_DIR)/tfplan_dev
+            artifact: tfplan_dev
+
+  - stage: apply_dev
+    displayName: "🚀 Apply – DEV"
+    dependsOn: plan_dev
+    condition: succeeded()
+    jobs:
+      - deployment: terraform_apply_dev
+        displayName: "Terraform Apply DEV"
+        environment: "dev"
+        pool: Default
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: templates/tf-setup.yml
+                - powershell: |
+                    Set-Location "$(TF_WORKING_DIR)"
+                    terraform workspace select dev
+                    terraform apply -auto-approve tfplan_dev
+                  displayName: "terraform apply (dev)"
+                  env:
+                    GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+
+  # ────────────────────────────────────────────────────────────
+  # BIGLAKE SETUP (nuevo) – escribe Delta en GCS y crea tabla
+  # ────────────────────────────────────────────────────────────
+  - stage: biglake_setup
+    displayName: "🔗 BigLake – Delta Lake en GCS"
+    dependsOn: apply_dev
+    condition: succeeded()
+    jobs:
+      - job: setup_biglake
+        displayName: "Escribir Delta → GCS → BigLake"
+        pool: Default
+        steps:
+          # Configurar credenciales GCP (reutiliza lógica del template)
+          - powershell: |
+              $base64 = $env:GCP_SA_KEY_JSON
+              $bytes  = [Convert]::FromBase64String($base64.Trim())
+              $json   = [System.Text.Encoding]::UTF8.GetString($bytes)
+              $path   = "$env:TEMP\sa_key.json"
+              [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding $false))
+              Write-Host "Credenciales escritas en $path"
+              echo "##vso[task.setvariable variable=GOOGLE_APPLICATION_CREDENTIALS]$path"
+            displayName: "Configurar credenciales GCP"
+            env:
+              GCP_SA_KEY_JSON: $(GCP_SA_KEY_JSON)
+
+          # Instalar Python y dependencias
+          - powershell: |
+              # Descargar Python embeddable (no requiere instalación ni admin)
+              $pyDir = "C:\agent\_work\python310"
+              $pyZip = "$env:TEMP\python-embed.zip"
+              $getpip = "$env:TEMP\get-pip.py"
+
+              if (-not (Test-Path "$pyDir\python.exe")) {
+                Write-Host "Descargando Python embeddable..."
+                Invoke-WebRequest "https://www.python.org/ftp/python/3.10.9/python-3.10.9-embed-amd64.zip" -OutFile $pyZip
+                Expand-Archive $pyZip -DestinationPath $pyDir -Force
+
+                # Habilitar pip en la versión embeddable
+                $pthFile = Get-ChildItem $pyDir -Filter "*._pth" | Select-Object -First 1
+                (Get-Content $pthFile.FullName) -replace "#import site", "import site" | Set-Content $pthFile.FullName
+
+                # Instalar pip
+                Invoke-WebRequest "https://bootstrap.pypa.io/get-pip.py" -OutFile $getpip
+                & "$pyDir\python.exe" $getpip --quiet
+              }
+
+              $python = "$pyDir\python.exe"
+              & $python --version
+              & $python -m pip install deltalake==0.17.4 pyarrow google-cloud-bigquery google-cloud-storage --quiet
+              Write-Host "✅ Dependencias instaladas"
+
+              echo "##vso[task.setvariable variable=PYTHON_EXE]$pyDir\python.exe"
+            displayName: "Instalar dependencias Python"
+
+          # Paso 1: escribir tabla Delta en GCS
+          - powershell: |
+              $env:GOOGLE_APPLICATION_CREDENTIALS = "$env:TEMP\sa_key.json"
+              $env:GCS_BUCKET = "$(GCS_BUCKET)"
+              $env:DELTA_PATH  = "$(DELTA_PATH)"
+              & "$(PYTHON_EXE)" "$(System.DefaultWorkingDirectory)/src/jobs/create_delta_data.py"
+            displayName: "Escribir tabla Delta en GCS"
+            env:
+              GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+
+          # Paso 2: crear/actualizar tabla BigLake en BigQuery
+          - powershell: |
+              $env:GOOGLE_APPLICATION_CREDENTIALS = "$env:TEMP\sa_key.json"
+              & "$(PYTHON_EXE)" "$(System.DefaultWorkingDirectory)/src/jobs/refresh_biglake.py" `
+                --gcs-bucket  "$(GCS_BUCKET)"  `
+                --delta-path  "$(DELTA_PATH)"  `
+                --gcp-project "$(GCP_PROJECT_ID)" `
+                --bq-dataset  "$(BQ_DATASET)"  `
+                --bq-table    "$(BQ_TABLE)"
+            displayName: "Crear tabla BigLake en BigQuery"
+            env:
+              GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+
+  # ────────────────────────────────────────────────────────────
+  # QA
+  # ────────────────────────────────────────────────────────────
+  - stage: plan_qa
+    displayName: "🔍 Plan – QA"
+    dependsOn: biglake_setup
+    condition: succeeded()
+    jobs:
+      - job: terraform_plan_qa
+        displayName: "Terraform Plan QA"
+        pool: Default
+        steps:
+          - template: templates/tf-setup.yml
+          - powershell: |
+              Set-Location "$(TF_WORKING_DIR)"
+              terraform workspace select qa
+              if ($LASTEXITCODE -ne 0) { terraform workspace new qa }
+              $project = "$(GCP_PROJECT_ID)"
+              $prefix  = "$(TF_PREFIX)"
+              $region  = "$(TF_REGION)"
+              terraform plan -var "project_id=$project" -var "prefix=$prefix" -var "region=$region" -target module.qa -out tfplan_qa
+            displayName: "terraform plan (qa)"
+            env:
+              GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+          - publish: $(TF_WORKING_DIR)/tfplan_qa
+            artifact: tfplan_qa
+
+  - stage: apply_qa
+    displayName: "🚀 Apply – QA  [requiere aprobación: Tech Lead]"
+    dependsOn: plan_qa
+    condition: succeeded()
+    jobs:
+      - deployment: terraform_apply_qa
+        displayName: "Terraform Apply QA"
+        environment: "qa"
+        pool: Default
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: templates/tf-setup.yml
+                - powershell: |
+                    Set-Location "$(TF_WORKING_DIR)"
+                    terraform workspace select qa
+                    terraform apply -auto-approve tfplan_qa
+                  displayName: "terraform apply (qa)"
+                  env:
+                    GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+
+  # ────────────────────────────────────────────────────────────
+  # PROD
+  # ────────────────────────────────────────────────────────────
+  - stage: plan_prod
+    displayName: "🔍 Plan – PROD"
+    dependsOn: apply_qa
+    condition: succeeded()
+    jobs:
+      - job: terraform_plan_prod
+        displayName: "Terraform Plan PROD"
+        pool: Default
+        steps:
+          - template: templates/tf-setup.yml
+          - powershell: |
+              Set-Location "$(TF_WORKING_DIR)"
+              terraform workspace select prod
+              if ($LASTEXITCODE -ne 0) { terraform workspace new prod }
+              $project = "$(GCP_PROJECT_ID)"
+              $prefix  = "$(TF_PREFIX)"
+              $region  = "$(TF_REGION)"
+              terraform plan -var "project_id=$project" -var "prefix=$prefix" -var "region=$region" -target module.prod -out tfplan_prod
+            displayName: "terraform plan (prod)"
+            env:
+              GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+          - publish: $(TF_WORKING_DIR)/tfplan_prod
+            artifact: tfplan_prod
+
+  - stage: apply_prod
+    displayName: "🚀 Apply – PROD  [requiere aprobación: Arquitecto/Owner]"
+    dependsOn: plan_prod
+    condition: succeeded()
+    jobs:
+      - deployment: terraform_apply_prod
+        displayName: "Terraform Apply PROD"
+        environment: "prod"
+        pool: Default
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: templates/tf-setup.yml
+                - powershell: |
+                    Set-Location "$(TF_WORKING_DIR)"
+                    terraform workspace select prod
+                    terraform apply -auto-approve tfplan_prod
+                  displayName: "terraform apply (prod)"
+                  env:
+                    GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
