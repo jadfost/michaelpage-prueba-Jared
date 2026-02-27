@@ -9,8 +9,13 @@ output "raw_bucket_url" {
 }
 
 output "bigquery_dataset_id" {
-  description = "ID del dataset de BigQuery"
+  description = "ID del dataset principal de BigQuery (US) — tablas nativas"
   value       = google_bigquery_dataset.dw.dataset_id
+}
+
+output "bigquery_omni_dataset_id" {
+  description = "ID del dataset BigQuery Omni (azure-eastus2) — solo tablas externas ADLS Gen2"
+  value       = google_bigquery_dataset.dw_omni.dataset_id
 }
 
 output "cloud_run_url" {

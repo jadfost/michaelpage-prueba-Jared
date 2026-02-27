@@ -13,7 +13,7 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "Región de GCP para los recursos"
+  description = "Región de GCP para recursos como Cloud Run, Vertex AI y GCS"
   type        = string
   default     = "us-central1"
 }
@@ -34,10 +34,4 @@ variable "cloud_run_image" {
   description = "Imagen Docker para el servicio Cloud Run (pipeline diario)"
   type        = string
   default     = "us-docker.pkg.dev/cloudrun/container/hello"
-}
-
-variable "bigquery_location" {
-  description = "Localización del dataset de BigQuery"
-  type        = string
-  default     = "US"
 }

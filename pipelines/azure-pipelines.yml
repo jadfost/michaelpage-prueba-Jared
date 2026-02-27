@@ -1,6 +1,6 @@
 # azure-pipelines.yml
 # Pipeline multi-stage: Terraform IaC en GCP con aprobaciones
-# + stage de federación BigLake (Delta Lake en GCS)
+# + stage de federación BigLake (Delta Lake en ADLS Gen2 Azure → BigQuery Omni)
 # Ramas: dev -> qa -> prod
 
 trigger:
@@ -11,7 +11,7 @@ trigger:
       - prod
 
 variables:
-  - group: gcp-credentials
+  - group: gcp-credentials        # GCP_PROJECT_ID, GCP_SA_KEY_JSON, ADLS_ACCESS_KEY
   - name: TF_VERSION
     value: "1.7.5"
   - name: TF_WORKING_DIR
@@ -28,6 +28,14 @@ variables:
     value: "dw_dev"
   - name: BQ_TABLE
     value: "transactions_federated"
+  - name: ADLS_ACCOUNT_NAME
+    value: "jaredpruebadelta"
+  - name: ADLS_CONTAINER
+    value: "datalake"
+  - name: ADLS_DELTA_PATH
+    value: "transactions_uniform"
+  - name: BQ_AZURE_CONNECTION
+    value: "348306483800.azure-eastus2.adls-biglake-conn"
 
 stages:
   # ────────────────────────────────────────────────────────────
@@ -70,7 +78,14 @@ stages:
             deploy:
               steps:
                 - template: templates/tf-setup.yml
+                # Descargar el plan generado en plan_dev para garantizar que
+                # se aplica exactamente lo que fue revisado/aprobado (no se recalcula).
+                - download: current
+                  artifact: tfplan_dev
+                  displayName: "Descargar artifact tfplan_dev"
                 - powershell: |
+                    # Copiar el plan al directorio de trabajo de Terraform
+                    Copy-Item "$(Pipeline.Workspace)/tfplan_dev/tfplan_dev" "$(TF_WORKING_DIR)/tfplan_dev"
                     Set-Location "$(TF_WORKING_DIR)"
                     terraform workspace select dev
                     terraform apply -auto-approve tfplan_dev
@@ -79,83 +94,122 @@ stages:
                     GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
 
   # ────────────────────────────────────────────────────────────
-  # BIGLAKE SETUP (nuevo) – escribe Delta en GCS y crea tabla
+  # BIGLAKE SETUP — escribe Delta en ADLS Gen2 y crea tabla externa
   # ────────────────────────────────────────────────────────────
   - stage: biglake_setup
-    displayName: "🔗 BigLake – Delta Lake en GCS"
+    displayName: "🔗 BigLake – Delta Lake ADLS Gen2 → BigQuery Omni"
     dependsOn: apply_dev
     condition: succeeded()
     jobs:
       - job: setup_biglake
-        displayName: "Escribir Delta → GCS → BigLake"
+        displayName: "Escribir Delta → ADLS Gen2 → BigLake"
         pool: Default
         steps:
-          # Configurar credenciales GCP (reutiliza lógica del template)
+
           - powershell: |
               $base64 = $env:GCP_SA_KEY_JSON
               $bytes  = [Convert]::FromBase64String($base64.Trim())
               $json   = [System.Text.Encoding]::UTF8.GetString($bytes)
               $path   = "$env:TEMP\sa_key.json"
               [System.IO.File]::WriteAllText($path, $json, (New-Object System.Text.UTF8Encoding $false))
-              Write-Host "Credenciales escritas en $path"
+              Write-Host "Credenciales GCP escritas en $path"
               echo "##vso[task.setvariable variable=GOOGLE_APPLICATION_CREDENTIALS]$path"
             displayName: "Configurar credenciales GCP"
             env:
               GCP_SA_KEY_JSON: $(GCP_SA_KEY_JSON)
 
-          # Instalar Python y dependencias
           - powershell: |
-              # Descargar Python embeddable (no requiere instalación ni admin)
-              $pyDir = "C:\agent\_work\python310"
-              $pyZip = "$env:TEMP\python-embed.zip"
+              $pyDir  = "C:\agent\_work\python310"
+              $pyZip  = "$env:TEMP\python-embed.zip"
               $getpip = "$env:TEMP\get-pip.py"
 
               if (-not (Test-Path "$pyDir\python.exe")) {
                 Write-Host "Descargando Python embeddable..."
                 Invoke-WebRequest "https://www.python.org/ftp/python/3.10.9/python-3.10.9-embed-amd64.zip" -OutFile $pyZip
                 Expand-Archive $pyZip -DestinationPath $pyDir -Force
-
-                # Habilitar pip en la versión embeddable
                 $pthFile = Get-ChildItem $pyDir -Filter "*._pth" | Select-Object -First 1
                 (Get-Content $pthFile.FullName) -replace "#import site", "import site" | Set-Content $pthFile.FullName
-
-                # Instalar pip
                 Invoke-WebRequest "https://bootstrap.pypa.io/get-pip.py" -OutFile $getpip
                 & "$pyDir\python.exe" $getpip --quiet
               }
 
-              $python = "$pyDir\python.exe"
-              & $python --version
-              & $python -m pip install deltalake==0.17.4 pyarrow google-cloud-bigquery google-cloud-storage --quiet
-              Write-Host "✅ Dependencias instaladas"
+              Write-Host "Instalando dependencias con soporte Azure..."
+              & "$pyDir\python.exe" -m pip install `
+                  "deltalake[azure]==0.17.4" `
+                  pyarrow `
+                  google-cloud-bigquery `
+                  google-cloud-storage `
+                  azure-storage-blob `
+                  pandas-gbq `
+                  --quiet
 
+              Write-Host "Dependencias instaladas"
               echo "##vso[task.setvariable variable=PYTHON_EXE]$pyDir\python.exe"
-            displayName: "Instalar dependencias Python"
+            displayName: "Instalar Python y dependencias (con soporte Azure)"
 
-          # Paso 1: escribir tabla Delta en GCS
           - powershell: |
               $env:GOOGLE_APPLICATION_CREDENTIALS = "$env:TEMP\sa_key.json"
-              $env:GCS_BUCKET = "$(GCS_BUCKET)"
-              $env:DELTA_PATH  = "$(DELTA_PATH)"
+              $env:GCS_BUCKET        = "$(GCS_BUCKET)"
+              $env:GCS_DELTA_PATH    = "$(DELTA_PATH)"
+              $env:ADLS_ACCOUNT_NAME = "$(ADLS_ACCOUNT_NAME)"
+              $env:ADLS_CONTAINER    = "$(ADLS_CONTAINER)"
+              $env:ADLS_DELTA_PATH   = "$(ADLS_DELTA_PATH)"
+              $env:ADLS_ACCESS_KEY   = $env:ADLS_ACCESS_KEY_SECRET
+
+              Write-Host "Paso 1: Escribiendo Delta Lake en ADLS Gen2: $(ADLS_ACCOUNT_NAME)/$(ADLS_CONTAINER)/$(ADLS_DELTA_PATH)"
               & "$(PYTHON_EXE)" "$(System.DefaultWorkingDirectory)/src/jobs/create_delta_data.py"
-            displayName: "Escribir tabla Delta en GCS"
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+              Write-Host "Tabla Delta escrita exitosamente en ADLS Gen2"
+            displayName: "Paso 1 — Escribir Delta Lake en ADLS Gen2 (Azure)"
             env:
               GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+              ADLS_ACCESS_KEY_SECRET: $(ADLS_ACCESS_KEY)
 
-          # Paso 2: crear/actualizar tabla BigLake en BigQuery
           - powershell: |
               $env:GOOGLE_APPLICATION_CREDENTIALS = "$env:TEMP\sa_key.json"
-              & "$(PYTHON_EXE)" "$(System.DefaultWorkingDirectory)/src/jobs/refresh_biglake.py" `
-                --gcs-bucket  "$(GCS_BUCKET)"  `
-                --delta-path  "$(DELTA_PATH)"  `
-                --gcp-project "$(GCP_PROJECT_ID)" `
-                --bq-dataset  "$(BQ_DATASET)"  `
-                --bq-table    "$(BQ_TABLE)"
-            displayName: "Crear tabla BigLake en BigQuery"
+              $env:BQ_PROJECT       = "$(GCP_PROJECT_ID)"
+              $env:BQ_DATASET       = "$(BQ_DATASET)"
+              $env:BQ_TABLE         = "$(BQ_TABLE)"
+              $env:BQ_CONNECTION    = "$(BQ_AZURE_CONNECTION)"
+              $env:ADLS_URI         = "abfss://$(ADLS_CONTAINER)@$(ADLS_ACCOUNT_NAME).dfs.core.windows.net/$(ADLS_DELTA_PATH)"
+              $env:ADLS_ACCOUNT_NAME = "$(ADLS_ACCOUNT_NAME)"
+              $env:ADLS_ACCESS_KEY  = $env:ADLS_ACCESS_KEY_VAR
+
+              Write-Host "Paso 2: Creando dw_dev_omni.transactions_federated en BigQuery Omni (azure-eastus2)..."
+              Write-Host "  Dataset destino: dw_dev_omni (azure-eastus2) — solo tabla externa DELTA_LAKE"
+              Write-Host "  Conexion: $env:BQ_CONNECTION"
+              Write-Host "  ADLS URI: $env:ADLS_URI"
+
+              & "$(PYTHON_EXE)" "$(System.DefaultWorkingDirectory)/src/jobs/create_biglake_omni.py"
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+              Write-Host "Tabla externa DELTA_LAKE creada en dw_dev_omni.transactions_federated (azure-eastus2)"
+            displayName: "Paso 2 — Crear tabla externa Omni (DELTA_LAKE) en dw_dev_omni (azure-eastus2)"
             env:
               GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+              ADLS_ACCESS_KEY_VAR: $(ADLS_ACCESS_KEY)
 
-  # ────────────────────────────────────────────────────────────
+          - powershell: |
+              $env:GOOGLE_APPLICATION_CREDENTIALS = "$env:TEMP\sa_key.json"
+              $env:ADLS_ACCESS_KEY = $env:ADLS_ACCESS_KEY_SECRET
+              Write-Host "Paso 3: Python ETL Bridge — Delta Lake ADLS Gen2 → BigQuery + MERGE"
+              Write-Host "  4.1+4.2 - ADLS Gen2 (deltalake) → dw_dev.transactions_staging (BigQuery US)"
+              Write-Host "  4.3     - customers + final_table (CREATE IF NOT EXISTS en US)"
+              Write-Host "  4.4     - MERGE transactions_staging + customers → final_table"
+              Write-Host "  4.5     - Labels Dataplex aplicados"
+              & "$(PYTHON_EXE)" "$(System.DefaultWorkingDirectory)/src/jobs/run_merge.py" `
+                --project        "$(GCP_PROJECT_ID)"    `
+                --dataset        "$(BQ_DATASET)"        `
+                --env            "dev"                  `
+                --adls-account   "$(ADLS_ACCOUNT_NAME)" `
+                --adls-container "$(ADLS_CONTAINER)"    `
+                --adls-path      "$(ADLS_DELTA_PATH)"
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+              Write-Host "ETL Bridge y MERGE ejecutados exitosamente en $(BQ_DATASET)"
+            displayName: "Paso 3 — ETL Bridge Delta Lake → BigQuery + MERGE en dw_dev (US)"
+            env:
+              GOOGLE_APPLICATION_CREDENTIALS: $(GOOGLE_APPLICATION_CREDENTIALS)
+              ADLS_ACCESS_KEY_SECRET: $(ADLS_ACCESS_KEY)
+
   # QA
   # ────────────────────────────────────────────────────────────
   - stage: plan_qa
@@ -196,7 +250,11 @@ stages:
             deploy:
               steps:
                 - template: templates/tf-setup.yml
+                - download: current
+                  artifact: tfplan_qa
+                  displayName: "Descargar artifact tfplan_qa"
                 - powershell: |
+                    Copy-Item "$(Pipeline.Workspace)/tfplan_qa/tfplan_qa" "$(TF_WORKING_DIR)/tfplan_qa"
                     Set-Location "$(TF_WORKING_DIR)"
                     terraform workspace select qa
                     terraform apply -auto-approve tfplan_qa
@@ -245,7 +303,11 @@ stages:
             deploy:
               steps:
                 - template: templates/tf-setup.yml
+                - download: current
+                  artifact: tfplan_prod
+                  displayName: "Descargar artifact tfplan_prod"
                 - powershell: |
+                    Copy-Item "$(Pipeline.Workspace)/tfplan_prod/tfplan_prod" "$(TF_WORKING_DIR)/tfplan_prod"
                     Set-Location "$(TF_WORKING_DIR)"
                     terraform workspace select prod
                     terraform apply -auto-approve tfplan_prod

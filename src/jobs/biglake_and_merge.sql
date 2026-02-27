@@ -1,28 +1,52 @@
 -- ================================================================
--- Parte 3: Tabla externa BigLake apuntando a Delta Lake en GCS
--- (100% gratuito – no requiere BigQuery Omni ni conexión Azure)
+-- Parte 3 — Tabla externa BigLake en dw_dev_omni (azure-eastus2)
+--
+-- RESTRICCIÓN de BigQuery Omni: los datasets en azure-eastus2
+-- solo admiten tablas EXTERNAS. No se pueden crear tablas nativas
+-- ni usar este dataset como destino de MERGE o INSERT.
+--
+-- Esta tabla es creada por create_biglake_omni.py en el pipeline.
+-- Se incluye aquí para referencia y reproducción manual.
 -- ================================================================
 
--- BigQuery soporta leer tablas Delta Lake directamente desde GCS
--- con format = 'DELTA'. Infiere el schema del _delta_log.
--- La tabla es creada/actualizada automáticamente por refresh_biglake.py
--- pero puedes ejecutar esta sentencia manualmente si lo necesitas.
-
-CREATE OR REPLACE EXTERNAL TABLE `dw_dev.transactions_federated`
+CREATE OR REPLACE EXTERNAL TABLE `dw_dev_omni.transactions_federated`
+WITH CONNECTION `projects/michaelpage-prueba/locations/azure-eastus2/connections/adls-biglake-conn`
 OPTIONS (
-  format = 'DELTA',
-  uris   = ['gs://raw-dev-michaelpage-prueba/delta/transactions/']
+  format = 'DELTA_LAKE',
+  uris   = ['azure://jaredpruebadelta.blob.core.windows.net/datalake/transactions_uniform/']
 );
 
--- Verificar que BigQuery lee los datos Delta desde GCS
-SELECT * FROM `dw_dev.transactions_federated` LIMIT 10;
+-- Verificar lectura directa desde Azure ADLS Gen2
+SELECT * FROM `michaelpage-prueba.dw_dev_omni.transactions_federated` LIMIT 10;
 
 
 -- ================================================================
--- Parte 4: Tablas de origen
+-- Materialización: dw_dev_omni → dw_dev.transactions_staging
+--
+-- BigQuery no permite JOINs ni MERGE entre datasets de regiones
+-- distintas. Para usar los datos de ADLS Gen2 en el MERGE, primero
+-- se exportan a GCS (desde azure-eastus2) y luego se cargan en
+-- dw_dev (US). run_merge.py automatiza este proceso.
+--
+-- Equivalente SQL (para referencia — se ejecuta vía Python API):
 -- ================================================================
 
--- Tabla nativa de clientes
+-- Paso A: Export a GCS (se ejecuta con location=azure-eastus2 en Python)
+-- EXPORT DATA OPTIONS(uri='gs://raw-dev-michaelpage-prueba/staging/transactions_omni_*.parquet', format='PARQUET')
+-- AS SELECT * FROM `dw_dev_omni.transactions_federated`;
+
+-- Paso B: Load GCS → tabla nativa (se ejecuta con LoadJobConfig en Python)
+-- La tabla transactions_staging se crea automáticamente con autodetect=True
+
+
+-- ================================================================
+-- Parte 4 — Tablas nativas en dw_dev (US)
+-- ================================================================
+
+-- Tabla de staging: copia materializada desde ADLS Gen2
+-- (creada automáticamente por run_merge.py via LoadJobConfig)
+
+-- Tabla maestra de clientes con labels Dataplex
 CREATE TABLE IF NOT EXISTS `dw_dev.customers` (
   customer_id   STRING  NOT NULL,
   customer_name STRING,
@@ -40,18 +64,16 @@ OPTIONS (
   ]
 );
 
--- Datos de clientes de referencia
-INSERT INTO `dw_dev.customers` (customer_id, customer_name, email, country, updated_at)
-VALUES
-  ('CUST-A', 'Ana García',    'ana@example.com',    'Colombia',  CURRENT_TIMESTAMP()),
-  ('CUST-B', 'Bob Smith',     'bob@example.com',    'USA',       CURRENT_TIMESTAMP()),
-  ('CUST-C', 'Carlos Lima',   'carlos@example.com', 'Brasil',    CURRENT_TIMESTAMP()),
-  ('CUST-D', 'Diana Pérez',   'diana@example.com',  'México',    CURRENT_TIMESTAMP());
+INSERT INTO `dw_dev.customers` VALUES
+  ('CUST-A', 'Alice Johnson',  'alice@example.com',  'Colombia', CURRENT_TIMESTAMP()),
+  ('CUST-B', 'Bob Smith',      'bob@example.com',    'Mexico',   CURRENT_TIMESTAMP()),
+  ('CUST-C', 'Carlos Rivera',  'carlos@example.com', 'Colombia', CURRENT_TIMESTAMP()),
+  ('CUST-D', 'Diana Torres',   'diana@example.com',  'Peru',     CURRENT_TIMESTAMP());
 
 
--- Tabla destino del MERGE (resultado enriquecido)
+-- Tabla destino del MERGE con labels Dataplex
 CREATE TABLE IF NOT EXISTS `dw_dev.final_table` (
-  transaction_id   STRING   NOT NULL,
+  transaction_id   STRING  NOT NULL,
   customer_id      STRING,
   customer_name    STRING,
   country          STRING,
@@ -72,7 +94,12 @@ OPTIONS (
 
 
 -- ================================================================
--- MERGE: transactions_federated (Delta/GCS) + customers → final_table
+-- Parte 4 — MERGE
+--
+-- Fuente: dw_dev.transactions_staging (materializada desde ADLS Gen2)
+-- Maestro: dw_dev.customers
+-- Destino: dw_dev.final_table
+-- Todo en dw_dev (US) — sin restricciones cross-region
 -- ================================================================
 
 MERGE `dw_dev.final_table` AS target
@@ -82,17 +109,16 @@ USING (
     t.customer_id,
     c.customer_name,
     c.country,
-    CAST(t.amount AS NUMERIC)        AS amount,
-    DATE(t.transaction_date)         AS transaction_date,
+    CAST(t.amount AS NUMERIC)   AS amount,
+    DATE(t.transaction_date)    AS transaction_date,
     t.status,
-    CURRENT_TIMESTAMP()              AS last_updated
-  FROM `dw_dev.transactions_federated` AS t
-  LEFT JOIN `dw_dev.customers`          AS c
+    CURRENT_TIMESTAMP()         AS last_updated
+  FROM `dw_dev.transactions_staging` AS t
+  LEFT JOIN `dw_dev.customers`        AS c
     ON t.customer_id = c.customer_id
 ) AS source
 ON target.transaction_id = source.transaction_id
 
--- Actualizar existentes si cambió algo relevante
 WHEN MATCHED AND (
   target.status        != source.status        OR
   target.customer_name != source.customer_name OR
@@ -104,31 +130,17 @@ WHEN MATCHED AND (
   status           = source.status,
   last_updated     = source.last_updated
 
--- Insertar nuevos registros
 WHEN NOT MATCHED BY TARGET THEN INSERT (
-  transaction_id,
-  customer_id,
-  customer_name,
-  country,
-  amount,
-  transaction_date,
-  status,
-  last_updated
+  transaction_id, customer_id, customer_name, country,
+  amount, transaction_date, status, last_updated
 ) VALUES (
-  source.transaction_id,
-  source.customer_id,
-  source.customer_name,
-  source.country,
-  source.amount,
-  source.transaction_date,
-  source.status,
-  source.last_updated
+  source.transaction_id, source.customer_id, source.customer_name,
+  source.country, source.amount, source.transaction_date,
+  source.status, source.last_updated
 );
 
 
--- ================================================================
--- Verificación post-MERGE
--- ================================================================
+-- Verificar resultado del MERGE
 SELECT
   status,
   COUNT(*)          AS total_records,
